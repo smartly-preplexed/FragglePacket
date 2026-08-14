@@ -14,6 +14,7 @@ path = "main.rs"
 [[bin]]
 name = "fraggle-desktop"
 path = "src/bin/desktop/main.rs"
+required-features = ["desktop"]
 
 [dependencies]
 clap = { version = "4.0", features = ["derive"] }
@@ -44,11 +45,14 @@ thiserror = "1.0"           # Error handling
 # HTTPS testing
 native-tls = { version = "0.2", features = ["alpn"] } # TLS support for HTTPS testing; alpn needed for GAP-025 preflight
 
-# Dioxus Desktop GUI
-dioxus = { version = "0.6", features = ["desktop"] }
+# Dioxus Desktop GUI (optional: only needed for the fraggle-desktop binary,
+# which additionally requires system GTK/webkit2gtk dev packages -- see
+# setup.sh. Gated behind the `desktop` feature so `cargo build`/`cargo test`
+# on the library, CLI, and TUI never has to touch GTK bindings.)
+dioxus = { version = "0.6", features = ["desktop"], optional = true }
 
-# File dialogs (cross-platform native)
-rfd = "0.15"
+# File dialogs (cross-platform native, desktop GUI only)
+rfd = { version = "0.15", optional = true }
 
 # Directories for config paths
 dirs = "5.0"
@@ -58,3 +62,7 @@ futures-util = "0.3"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 users = "0.11"
+
+[features]
+default = []
+desktop = ["dep:dioxus", "dep:rfd"]
