@@ -80,4 +80,5 @@ pub use printer_raw::Raw9100BulkTest;
 pub use tcp_options_echo::TcpOptionsEchoTest;
 pub use quic_pmtud::QuicPmtudTest;
 pub use dns_secure::DnsSecureCompareTest;
+pub use rtt::RttTest;
 

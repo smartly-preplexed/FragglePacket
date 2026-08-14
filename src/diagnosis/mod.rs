@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::network_tests::{HttpsTestResult, HttpsDiagnosis};
+use crate::noc_metrics::threshold::{CompareOp, ThresholdConfig, ThresholdProfile, WindowType};
+use crate::noc_metrics::window::Sample;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Diagnosis {
@@ -53,6 +55,14 @@ pub struct DiagnosisEvidence {
     pub dns_success: Option<bool>,
     pub packet_loss_percent: Option<f64>,
     pub rtt_ms: Option<f64>,
+    /// Optional time-series samples backing `packet_loss_percent`/`rtt_ms`
+    /// for callers (e.g. a monitoring loop) that have more than one
+    /// measurement to offer. When empty, `HighPacketLossRule`/
+    /// `HighLatencyRule` fall back to treating the scalar field above as a
+    /// single-sample window, which is exactly equivalent to the old
+    /// point-threshold check.
+    pub packet_loss_samples: Vec<Sample>,
+    pub rtt_samples: Vec<Sample>,
     // Shell-script-equivalent evidence
     pub upload_fail_sizes: Vec<usize>,
     pub ssh_banner_ok: Option<bool>,
@@ -271,92 +281,154 @@ impl DiagnosisRule for TcpSegmentationLimitRule {
     }
 }
 
-/// High Packet Loss Rule
+/// Default packet-loss `ThresholdProfile`, adapted from NOC's
+/// `pm.models.thresholdprofile.ThresholdProfile`: rungs are ordered
+/// most-severe-first, each with its own open condition and a looser clear
+/// condition to give hysteresis. `window_function = "avg"` smooths a
+/// multi-sample window (e.g. from a monitoring loop feeding
+/// `packet_loss_samples`); with a single sample it is numerically
+/// identical to a plain point check, which is what `report`'s one-shot use
+/// gets today.
+pub fn packet_loss_profile() -> ThresholdProfile {
+    ThresholdProfile {
+        name: "packet_loss",
+        window_type: WindowType::Measurements,
+        window: 5,
+        window_function: "avg",
+        thresholds: vec![
+            ThresholdConfig::new("high", CompareOp::Ge, 10.0, CompareOp::Lt, 8.0),
+            ThresholdConfig::new("medium", CompareOp::Ge, 1.0, CompareOp::Lt, 0.5),
+        ],
+    }
+}
+
+/// Default RTT/latency `ThresholdProfile` -- see `packet_loss_profile` for
+/// the rationale.
+pub fn latency_profile() -> ThresholdProfile {
+    ThresholdProfile {
+        name: "latency",
+        window_type: WindowType::Measurements,
+        window: 5,
+        window_function: "avg",
+        thresholds: vec![ThresholdConfig::new(
+            "medium",
+            CompareOp::Gt,
+            200.0,
+            CompareOp::Le,
+            180.0,
+        )],
+    }
+}
+
+/// High Packet Loss Rule -- backed by a NOC-style [`ThresholdProfile`]
+/// (see `noc_metrics::threshold`) instead of a bare `if`/`else` on magic
+/// numbers. Prefers `evidence.packet_loss_samples` (a real window) when the
+/// caller supplied one, and otherwise falls back to treating
+/// `evidence.packet_loss_percent` as a single-sample window -- which is
+/// exactly equivalent to the point check this rule used to do.
 pub struct HighPacketLossRule;
 
 impl DiagnosisRule for HighPacketLossRule {
     fn name(&self) -> &str {
         "High Packet Loss Detector"
     }
-    
+
     fn check(&self, evidence: &DiagnosisEvidence) -> Option<Diagnosis> {
-        let loss_percent = evidence.packet_loss_percent?;
-        
-        if loss_percent >= 10.0 {
-            return Some(Diagnosis {
-                issue: DiagnosisIssue::PacketLoss,
-                severity: Severity::High,
-                description: format!(
-                    "High packet loss detected ({:.1}%). This will significantly impact application performance.",
-                    loss_percent
-                ),
-                recommendation: "Investigate packet loss:\n\
+        let samples: Vec<Sample> = if !evidence.packet_loss_samples.is_empty() {
+            evidence.packet_loss_samples.clone()
+        } else {
+            vec![(0, evidence.packet_loss_percent?)]
+        };
+
+        let profile = packet_loss_profile();
+        let (loss_percent, matched) = profile.evaluate(&samples).ok().flatten()?;
+
+        let (severity, recommendation) = match matched.label {
+            "high" => (
+                Severity::High,
+                "Investigate packet loss:\n\
                     - Check physical cable connections\n\
                     - Test with different network interfaces\n\
                     - Check for network congestion\n\
                     - Run path analysis to identify problematic hop\n\
-                    - Contact ISP if issue persists".to_string(),
-                related_tests: vec![
-                    "Packet Loss Test".to_string(),
-                    "Path Analysis Test".to_string(),
-                ],
-            });
-        } else if loss_percent >= 1.0 {
-            return Some(Diagnosis {
-                issue: DiagnosisIssue::PacketLoss,
-                severity: Severity::Medium,
-                description: format!(
-                    "Moderate packet loss detected ({:.1}%). May affect real-time applications.",
-                    loss_percent
-                ),
-                recommendation: "Monitor packet loss:\n\
+                    - Contact ISP if issue persists"
+                    .to_string(),
+            ),
+            _ => (
+                Severity::Medium,
+                "Monitor packet loss:\n\
                     - Continue monitoring\n\
                     - May affect VoIP, video conferencing\n\
-                    - Consider running path analysis".to_string(),
-                related_tests: vec!["Packet Loss Test".to_string()],
-            });
-        }
-        
-        None
+                    - Consider running path analysis"
+                    .to_string(),
+            ),
+        };
+
+        let description = if matched.label == "high" {
+            format!(
+                "High packet loss detected ({:.1}%). This will significantly impact application performance.",
+                loss_percent
+            )
+        } else {
+            format!(
+                "Moderate packet loss detected ({:.1}%). May affect real-time applications.",
+                loss_percent
+            )
+        };
+
+        Some(Diagnosis {
+            issue: DiagnosisIssue::PacketLoss,
+            severity,
+            description,
+            recommendation,
+            related_tests: vec![
+                "Packet Loss Test".to_string(),
+                "Path Analysis Test".to_string(),
+            ],
+        })
     }
 }
 
-/// High Latency Rule
+/// High Latency Rule -- see [`HighPacketLossRule`] for the same
+/// threshold-profile / windowed-sample rationale.
 pub struct HighLatencyRule;
 
 impl DiagnosisRule for HighLatencyRule {
     fn name(&self) -> &str {
         "High Latency Detector"
     }
-    
+
     fn check(&self, evidence: &DiagnosisEvidence) -> Option<Diagnosis> {
-        let rtt_ms = evidence.rtt_ms?;
-        
-        if rtt_ms > 200.0 {
-            return Some(Diagnosis {
-                issue: DiagnosisIssue::HighLatency,
-                severity: Severity::Medium,
-                description: format!(
-                    "High latency detected ({:.1}ms). This may impact interactive applications.",
-                    rtt_ms
-                ),
-                recommendation: format!(
-                    "Reduce latency:\n\
+        let samples: Vec<Sample> = if !evidence.rtt_samples.is_empty() {
+            evidence.rtt_samples.clone()
+        } else {
+            vec![(0, evidence.rtt_ms?)]
+        };
+
+        let profile = latency_profile();
+        let (rtt_ms, _matched) = profile.evaluate(&samples).ok().flatten()?;
+
+        Some(Diagnosis {
+            issue: DiagnosisIssue::HighLatency,
+            severity: Severity::Medium,
+            description: format!(
+                "High latency detected ({:.1}ms). This may impact interactive applications.",
+                rtt_ms
+            ),
+            recommendation: format!(
+                "Reduce latency:\n\
                     - Check for network congestion\n\
                     - Use closer/faster DNS servers\n\
                     - Consider CDN for content delivery\n\
                     - Run path analysis to find slow hops\n\
                     - Current RTT: {:.1}ms (good: <50ms, acceptable: <150ms)",
-                    rtt_ms
-                ),
-                related_tests: vec![
-                    "RTT Test".to_string(),
-                    "Path Analysis Test".to_string(),
-                ],
-            });
-        }
-        
-        None
+                rtt_ms
+            ),
+            related_tests: vec![
+                "RTT Test".to_string(),
+                "Path Analysis Test".to_string(),
+            ],
+        })
     }
 }
 
@@ -604,6 +676,79 @@ mod tests {
         let has_mismatch = diagnoses.iter()
             .any(|d| d.issue == DiagnosisIssue::PathMtuMismatch);
         assert!(has_mismatch);
+    }
+
+    #[test]
+    fn high_packet_loss_rule_matches_the_old_point_thresholds_from_a_single_sample() {
+        let engine = DiagnosisEngine::new();
+
+        let high = DiagnosisEvidence { packet_loss_percent: Some(12.0), ..Default::default() };
+        let diagnoses = engine.diagnose(&high);
+        let d = diagnoses.iter().find(|d| d.issue == DiagnosisIssue::PacketLoss).unwrap();
+        assert_eq!(d.severity, Severity::High);
+
+        let medium = DiagnosisEvidence { packet_loss_percent: Some(2.0), ..Default::default() };
+        let diagnoses = engine.diagnose(&medium);
+        let d = diagnoses.iter().find(|d| d.issue == DiagnosisIssue::PacketLoss).unwrap();
+        assert_eq!(d.severity, Severity::Medium);
+
+        let fine = DiagnosisEvidence { packet_loss_percent: Some(0.1), ..Default::default() };
+        let diagnoses = engine.diagnose(&fine);
+        assert!(!diagnoses.iter().any(|d| d.issue == DiagnosisIssue::PacketLoss));
+    }
+
+    #[test]
+    fn high_latency_rule_matches_the_old_point_threshold_from_a_single_sample() {
+        let engine = DiagnosisEngine::new();
+
+        let slow = DiagnosisEvidence { rtt_ms: Some(250.0), ..Default::default() };
+        let diagnoses = engine.diagnose(&slow);
+        assert!(diagnoses.iter().any(|d| d.issue == DiagnosisIssue::HighLatency));
+
+        let fine = DiagnosisEvidence { rtt_ms: Some(40.0), ..Default::default() };
+        let diagnoses = engine.diagnose(&fine);
+        assert!(!diagnoses.iter().any(|d| d.issue == DiagnosisIssue::HighLatency));
+    }
+
+    #[test]
+    fn packet_loss_rule_windows_multiple_samples_instead_of_only_looking_at_the_last_one() {
+        // A single spike among otherwise-clean samples must not, on
+        // average, trip the "high" rung -- this is only possible because
+        // the rule now runs a window function instead of comparing the
+        // latest sample alone.
+        let engine = DiagnosisEngine::new();
+        let ev = DiagnosisEvidence {
+            packet_loss_samples: vec![(0, 0.0), (1, 0.0), (2, 30.0), (3, 0.0), (4, 0.0)],
+            ..Default::default()
+        };
+        let diagnoses = engine.diagnose(&ev);
+        let d = diagnoses.iter().find(|d| d.issue == DiagnosisIssue::PacketLoss);
+        // Averaged over the 5-sample window the spike works out to 6%,
+        // which crosses the "medium" rung but must NOT reach "high" (>=10%)
+        // the way comparing only the raw 30% spike would have.
+        assert_eq!(d.map(|d| &d.severity), Some(&Severity::Medium));
+    }
+
+    #[test]
+    fn threshold_state_hysteresis_is_available_for_repeated_evaluation() {
+        // Demonstrates that a caller doing repeated evaluation (e.g. a
+        // monitoring loop) can opt into stateful hysteresis via
+        // `ThresholdState`, rather than the diagnosis engine's stateless
+        // per-call check re-triggering on every noisy tick.
+        use crate::noc_metrics::threshold::ThresholdState;
+
+        let profile = packet_loss_profile();
+        let mut state = ThresholdState::new();
+
+        assert!(state.evaluate(&profile, &[(0, 5.0)]).unwrap().is_some());
+        assert!(state.is_open());
+        // Dips back under the open threshold (1.0) but not below the clear
+        // threshold (0.5): a naive point check would flap closed here.
+        assert!(state.evaluate(&profile, &[(1, 0.7)]).unwrap().is_some());
+        assert!(state.is_open());
+        // Crosses the clear threshold: now it closes.
+        assert!(state.evaluate(&profile, &[(2, 0.2)]).unwrap().is_none());
+        assert!(!state.is_open());
     }
 }
 

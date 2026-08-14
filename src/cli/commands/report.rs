@@ -20,7 +20,7 @@ fn run_unified_report(target: &str, json: bool) {
     use fraggle_packet::diagnosis::{render_unified_report, DiagnosisEngine, DiagnosisEvidence};
     use fraggle_packet::framework::NetworkTest;
     use fraggle_packet::network_tests::{
-        https::HttpsTest, Raw9100BulkTest, SshDataPathTest, UploadSizeSweepTest,
+        https::HttpsTest, Raw9100BulkTest, RttTest, SshDataPathTest, UploadSizeSweepTest,
     };
     let mut ev = DiagnosisEvidence::default();
     // In JSON mode every probe result is collected and emitted once as an array,
@@ -34,6 +34,18 @@ fn run_unified_report(target: &str, json: bool) {
         if let Some(connect) = r.metrics.get("tls_success") {
             ev.tcp_connect_success = Some(*connect > 0.5);
         }
+        if json { collected.push(r.clone()); } else { print_test_result(&r); }
+    }
+    if let Ok(r) = RttTest::new().run(target) {
+        // Feeds HighPacketLossRule / HighLatencyRule (src/diagnosis/mod.rs),
+        // which previously never received real data here -- report's
+        // evidence never ran an RTT/loss probe at all, so those two rules
+        // were unreachable outside of unit tests that built evidence by
+        // hand. `loss_percent`/`avg_ms` are `Option<f64>` on purpose (GAP-009):
+        // a missing/unparsed ping summary must stay `None`, never a
+        // fabricated `0.0`.
+        ev.packet_loss_percent = r.metrics.get("loss_percent").copied();
+        ev.rtt_ms = r.metrics.get("avg_ms").copied();
         if json { collected.push(r.clone()); } else { print_test_result(&r); }
     }
     if let Ok(r) = UploadSizeSweepTest::new().run(target) {
